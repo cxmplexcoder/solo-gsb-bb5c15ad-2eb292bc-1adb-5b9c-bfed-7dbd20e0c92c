@@ -15,6 +15,11 @@
   时长与源区间长度之比线性映射到成片时间轴；精确计算后四舍五入到毫秒，
   丢弃舍入后零时长片段，返回可直接送入 ``/layout/wrap`` 的片段及未产生输出
   的字幕下标。
+- ``POST /timeline/select``：接收可能互相重叠的成片片段（结构与
+  ``/edits/project`` 的输出兼容），为单条字幕展示轨选出互不重叠的完整片段
+  （半开区间，端点相接可共存，不裁剪）；按「保留总展示时长最大 → 保留条数
+  最多 → 输入下标升序序列字典序最小」的优先级全局优选，返回按开始时间与
+  输入下标排序的 ``kept``（保留原字段）及按输入顺序排列的 ``dropped_indices``。
 """
 from __future__ import annotations
 
@@ -191,6 +196,38 @@ class ProjectEditsResponse(BaseModel):
     segments: List[ProjectedSegment]
     unused_segment_indices: List[int] = Field(
         ..., description="未在任何剪辑中产生有效输出的字幕下标（升序）"
+    )
+
+
+class TimelineSegment(BaseModel):
+    """成片时间轴上的一条展示片段，结构与 ``/edits/project`` 的输出兼容。
+
+    除 ``start`` / ``end`` / ``text`` 外，允许携带 ``segment_index`` /
+    ``clip_index`` 及任意额外字段，选中时原样保留。
+    """
+
+    start: int = Field(..., description="片段起始时间（毫秒）")
+    end: int = Field(..., description="片段结束时间（毫秒，半开区间）")
+    text: str = Field("", description="字幕文字")
+
+    model_config = {"extra": "allow"}
+
+
+class TimelineSelectRequest(BaseModel):
+    segments: List[TimelineSegment] = Field(
+        ..., description="待筛选的展示片段，允许为空列表"
+    )
+
+
+class TimelineSelectResponse(BaseModel):
+    kept: List[dict] = Field(
+        ...,
+        description=(
+            "入选片段，保留输入时的全部字段；按 (start, 输入下标) 升序排列"
+        ),
+    )
+    dropped_indices: List[int] = Field(
+        ..., description="未入选片段在输入 segments 中的下标，按输入顺序排列"
     )
 
 
@@ -885,6 +922,116 @@ def project_edits(
 
 
 # --------------------------------------------------------------------------- #
+# 单轨选段逻辑
+# --------------------------------------------------------------------------- #
+def select_timeline(
+    req: TimelineSelectRequest,
+) -> tuple[Optional[TimelineSelectResponse], List[ErrorItem]]:
+    """从可能互相重叠的片段中为单条展示轨选互不重叠的完整片段。
+
+    片段按半开区间 ``[start, end)`` 处理，端点相接（一个 ``end`` 等于另一个
+    ``start``）可共存；入选片段不做任何裁剪。在全部可行方案中依次优化：
+      1. 保留片段的总展示时长 ``sum(end - start)`` 最大；
+      2. 总时长持平，保留条数最多；
+      3. 仍持平，入选片段输入下标升序序列的字典序最小。
+
+    实现为按结束时间排序的带权区间调度动态规划。三层目标编码进一个 Python
+    任意精度整数得分：``W = DUR_UNIT * 总时长 + COUNT_BASE * 条数 + reversed_mask``，
+    其中 ``COUNT_BASE = 2^n``（严格大于掩码部分的最大值 ``2^n - 1``）、
+    ``DUR_UNIT = (n + 1) * 2^n``（严格大于「条数 + 掩码」的最大合计
+    ``n * 2^n + 2^n - 1``），``reversed_mask`` 把输入下标 ``i`` 放在从高位起
+    第 ``i`` 位——按无符号整数比较它恰好等价于「按下标升序序列的字典序，
+    序列小者为大」。于是标准「选 / 不选」DP 最大化该单一得分即同时满足
+    三层优先级，无平局。
+    """
+    errors: List[ErrorItem] = []
+    segments = req.segments
+    for idx, seg in enumerate(segments):
+        if seg.start < 0:
+            errors.append(
+                ErrorItem(
+                    location="segments.start",
+                    index=idx,
+                    code="negative_time",
+                    message=f"segments 第 {idx} 条 start 为负：{seg.start}",
+                )
+            )
+        if seg.end < 0:
+            errors.append(
+                ErrorItem(
+                    location="segments.end",
+                    index=idx,
+                    code="negative_time",
+                    message=f"segments 第 {idx} 条 end 为负：{seg.end}",
+                )
+            )
+        if seg.end - seg.start <= 0:
+            errors.append(
+                ErrorItem(
+                    location="segments.end",
+                    index=idx,
+                    code="non_positive_duration",
+                    message=(
+                        f"segments 第 {idx} 条时长非正：start={seg.start}，"
+                        f"end={seg.end}，要求 end > start"
+                    ),
+                )
+            )
+    if errors:
+        return None, errors
+
+    n = len(segments)
+    if n == 0:
+        return TimelineSelectResponse(kept=[], dropped_indices=[]), []
+
+    # 按 (end, start, 输入下标) 排序；下标作为兜底保证顺序确定
+    order = sorted(range(n), key=lambda i: (segments[i].end, segments[i].start, i))
+    ends = [segments[i].end for i in order]
+
+    count_base = 1 << n                  # 掩码部分占低 n 位，条数占其上
+    dur_unit = (n + 1) * count_base      # 严格大于「条数 + 掩码」的最大合计
+
+    # dp[k]：只考虑排序后前 k 个片段时的最优得分；take[k] 记录第 k 个片段
+    # （1 基）是否在该最优方案中，用于重建。
+    dp: List[int] = [0] * (n + 1)
+    take: List[bool] = [False] * (n + 1)
+
+    for k in range(1, n + 1):
+        i = order[k - 1]
+        seg = segments[i]
+        # p：排序序列中最后一个 end <= seg.start 的片段数（端点相接可共存）
+        p = bisect_right(ends, seg.start, hi=k - 1)
+        bit = 1 << (n - 1 - i)
+        gain = dur_unit * (seg.end - seg.start) + count_base + bit
+        score_take = dp[p] + gain
+        score_skip = dp[k - 1]
+        if score_take > score_skip:
+            dp[k] = score_take
+            take[k] = True
+        else:
+            dp[k] = score_skip
+
+    chosen: List[int] = []
+    k = n
+    while k > 0:
+        if take[k]:
+            i = order[k - 1]
+            chosen.append(i)
+            k = bisect_right(ends, segments[i].start, hi=k - 1)
+        else:
+            k -= 1
+
+    chosen_set = set(chosen)
+    # 入选片段按 (start, 输入下标) 升序排列，保留输入时的全部字段（含额外字段）
+    kept_order = sorted(chosen, key=lambda i: (segments[i].start, i))
+    kept = [json.loads(segments[i].model_dump_json()) for i in kept_order]
+    dropped_indices = [i for i in range(n) if i not in chosen_set]
+    return TimelineSelectResponse(
+        kept=kept, dropped_indices=dropped_indices
+    ), []
+
+
+# --------------------------------------------------------------------------- #
 # FastAPI
 # --------------------------------------------------------------------------- #
 app = FastAPI(
@@ -898,9 +1045,12 @@ app = FastAPI(
         "3. ``POST /layout/wrap``：按显示宽度（全角/宽字符 2 格、其余 1 格）"
         "为字幕片段做全局最优断行，返回各行文字与断行字符偏移；\n"
         "4. ``POST /edits/project``：把源字幕按剪辑段（允许源区间重叠、重排、"
-        "重复使用）线性投影到成片时间轴，返回可直接送入 /layout/wrap 的片段。"
+        "重复使用）线性投影到成片时间轴，返回可直接送入 /layout/wrap 的片段；\n"
+        "5. ``POST /timeline/select``：从可能互相重叠的成片片段中为单条字幕"
+        "展示轨选出互不重叠的完整片段，按保留总展示时长最大、条数最多、下标"
+        "升序序列字典序最小的优先级全局优选。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -961,6 +1111,22 @@ def edits_project_endpoint(req: ProjectEditsRequest) -> ProjectEditsResponse:
             status_code=422,
             content={
                 "error": "edit_project_failed",
+                "detail": [e.model_dump() for e in errors],
+            },
+        )
+    return resp  # type: ignore[return-value]
+
+
+@app.post("/timeline/select", response_model=TimelineSelectResponse)
+def timeline_select_endpoint(
+    req: TimelineSelectRequest,
+) -> TimelineSelectResponse:
+    resp, errors = select_timeline(req)
+    if errors:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "timeline_select_failed",
                 "detail": [e.model_dump() for e in errors],
             },
         )

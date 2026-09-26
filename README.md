@@ -1,11 +1,12 @@
 # 访谈字幕时间轴校准 API
 
-基于 Python + FastAPI 的字幕时间轴校准服务，提供四个接口：
+基于 Python + FastAPI 的字幕时间轴校准服务，提供五个接口：
 
 1. **`POST /anchors/suggest` 锚点推荐**：提交**原片**与**成片**两条按开始时间严格递增的字幕序列，服务端在允许跳过片段的前提下做**全局最优**的文字精确匹配（重复台词、删段均按全局最优处理，而非逐条贪心），返回可直接用于 `/calibrate` 的同步锚点。
 2. **`POST /calibrate` 时间轴校准**：提交以**原录音毫秒**计时的字幕片段，以及至少两组「原时间 → 成片时间」同步锚点；服务端在相邻锚点之间做**分段线性换算**，输出成片时间轴上的字幕起止时间。
 3. **`POST /layout/wrap` 字幕断行**：提交字幕片段与行宽、行数约束，服务端按 **Unicode 码点显示宽度**（东亚全角/宽字符占 2 格、其余占 1 格）为每段做**全局最优**断行，保留原时码与文字，返回每段的各行文字与断行字符偏移。
 4. **`POST /edits/project` 剪辑投影**：提交源字幕 `segments` 与按成片顺序排列的 `clips`（允许源区间**重叠、重排、重复使用**）；服务端按**半开区间**求每条字幕与每段剪辑的交集，再按剪辑时长与源区间长度之比**线性映射**到成片时间轴，四舍五入到毫秒后丢弃零时长片段，返回可直接送入 `/layout/wrap` 的片段及未产生输出的字幕下标。
+5. **`POST /timeline/select` 单轨选段**：提交可能**互相重叠**的成片片段（结构与 `/edits/project` 的输出兼容），服务端为**单条字幕展示轨**选出互不重叠的完整片段（不裁剪），按「保留总展示时长最大 → 保留条数最多 → 输入下标升序序列字典序最小」的优先级**全局优选**，返回入选片段与落选下标。
 
 ## 功能说明
 
@@ -90,6 +91,24 @@
 
   缺字段、类型错误等请求格式问题返回 `422` 且 `error` 为 `invalid_request`。
 
+### 单轨选段 `/timeline/select`
+
+- 接收 `segments[]`：成片时间轴上的展示片段，每条含整数毫秒 `start` / `end`（半开区间 `[start, end)`）与 `text`（可省略，默认为空字符串），要求 `start >= 0` 且 `end > start`。元素结构与 `/edits/project` 的输出兼容——可携带 `segment_index` / `clip_index` 及任意额外字段，选中时**原样保留**；把 `/edits/project` 响应的 `segments` 直接作为本接口的 `segments` 即可。
+- 为**单条字幕展示轨**从片段中选出一个**互不重叠**的子集：片段一律按完整片段取舍，**不做任何裁剪**；按半开区间判定重叠，**端点相接**（一个片段的 `end` 等于另一个的 `start`）**可共存**。
+- 在全部可行子集中依次选择（**全局最优**，带权区间调度，而非贪心）：
+  1. 保留片段的**总展示时长** `sum(end - start)` 最大；
+  2. 总时长持平，**保留条数**最多；
+  3. 仍持平，入选片段**输入下标升序序列的字典序**最小（下标序列小者胜出）。
+- 成功响应：
+  - `kept[]`：入选片段，**保留输入时的全部字段**（含 `segment_index` / `clip_index` 与额外字段），按 `(start, 输入下标)` 升序排列；同样可直接随 `max_width` / `max_lines` 送入 `/layout/wrap`。
+  - `dropped_indices[]`：未入选片段在输入 `segments` 中的下标，**按输入顺序**（升序）排列。
+- `segments` 为**空列表**时返回空结果 `{"kept": [], "dropped_indices": []}`。
+- 以下情况返回 `422`，错误一次性收集，`location` 标明字段、`index` 标明元素下标：
+  - `segments[].start` 或 `segments[].end` 为负（`negative_time`）；
+  - `segments[].end <= segments[].start`（`non_positive_duration`）。
+
+  缺字段、类型错误等请求格式问题返回 `422` 且 `error` 为 `invalid_request`。
+
 ## 单条启动命令
 
 无需手动安装依赖，依赖安装与服务启动均已纳入容器启动流程（构建镜像时安装依赖，容器启动时启动服务）：
@@ -130,6 +149,7 @@ docker compose down
 | 校准接口 | `POST http://localhost:8000/calibrate` |
 | 字幕断行接口 | `POST http://localhost:8000/layout/wrap` |
 | 剪辑投影接口 | `POST http://localhost:8000/edits/project` |
+| 单轨选段接口 | `POST http://localhost:8000/timeline/select` |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI Schema | `http://localhost:8000/openapi.json` |
 
@@ -451,6 +471,72 @@ docker compose down
 
 字段缺失或类型错误等请求格式问题返回 `422` 且 `error` 为 `invalid_request`。
 
+### 请求 `POST /timeline/select`
+
+```json
+{
+  "segments": [
+    { "start": 0, "end": 1500, "text": "我们开始今天的话题", "segment_index": 2, "clip_index": 0 },
+    { "start": 1200, "end": 3000, "text": "与上一段重叠的台词", "segment_index": 3, "clip_index": 0 },
+    { "start": 1500, "end": 4500, "text": "欢迎来到访谈节目", "segment_index": 1, "clip_index": 1 },
+    { "start": 4500, "end": 5000, "text": "端点相接可共存", "segment_index": 4, "clip_index": 1 }
+  ]
+}
+```
+
+- `segments[]`：待筛选的展示片段，允许为空列表；`start` / `end` 为整数毫秒（半开区间），要求 `start >= 0`、`end > start`；`text` 可省略（默认空字符串）。
+- 允许携带 `segment_index` / `clip_index`（即 `/edits/project` 的输出结构）及任意额外字段，选中时原样保留。
+- 上例中第 0 段与第 1 段在 `[1200, 1500)` 重叠，二者只能取其一：保留第 0、2、3 段的总展示时长为 `1500 + 3000 + 500 = 5000ms`，优于任何包含第 1 段的方案；第 2 段与第 3 段端点相接（`4500 == 4500`），可共存。
+
+### 成功响应 `200`
+
+```json
+{
+  "kept": [
+    { "start": 0, "end": 1500, "text": "我们开始今天的话题", "segment_index": 2, "clip_index": 0 },
+    { "start": 1500, "end": 4500, "text": "欢迎来到访谈节目", "segment_index": 1, "clip_index": 1 },
+    { "start": 4500, "end": 5000, "text": "端点相接可共存", "segment_index": 4, "clip_index": 1 }
+  ],
+  "dropped_indices": [1]
+}
+```
+
+- `kept[]` 按 `(start, 输入下标)` 升序排列，保留输入时的全部字段；`dropped_indices[]` 按输入顺序排列（上例第 1 段因重叠且不在最优方案中而落选）。
+- `segments` 为空列表时返回 `{"kept": [], "dropped_indices": []}`。
+
+### 单轨选段错误响应 `422`
+
+所有校验错误一次性收集返回，`location` 标明字段，`index` 为元素下标：
+
+```json
+{
+  "error": "timeline_select_failed",
+  "detail": [
+    {
+      "location": "segments.start",
+      "index": 0,
+      "code": "negative_time",
+      "message": "segments 第 0 条 start 为负：-100"
+    },
+    {
+      "location": "segments.end",
+      "index": 1,
+      "code": "non_positive_duration",
+      "message": "segments 第 1 条时长非正：start=800，end=800，要求 end > start"
+    }
+  ]
+}
+```
+
+错误代码：
+
+| code | 含义 |
+| --- | --- |
+| `negative_time` | `segments[].start` 或 `segments[].end` 为负毫秒 |
+| `non_positive_duration` | `segments[].end <= segments[].start`，时长非正 |
+
+字段缺失或类型错误等请求格式问题返回 `422` 且 `error` 为 `invalid_request`。
+
 ## 调用示例
 
 ### 第一步：`/anchors/suggest` 自动生成锚点
@@ -617,6 +703,38 @@ curl -s -X POST http://localhost:8000/layout/wrap \
   }'
 ```
 
+### `/timeline/select` 为单条展示轨选出互不重叠片段
+
+剪辑投影可能产生互相重叠的片段（源区间重叠/重复使用时）。把 `/edits/project` 响应的 `segments` 原样传入即可，服务端按「总时长最大 → 条数最多 → 下标序列字典序最小」选出一条完整片段互不重叠的单字幕轨（端点相接可共存，不裁剪）：
+
+```bash
+curl -s -X POST http://localhost:8000/timeline/select \
+  -H "Content-Type: application/json" \
+  -d '{
+    "segments": [
+      {"start": 0, "end": 1500, "text": "我们开始今天的话题", "segment_index": 2, "clip_index": 0},
+      {"start": 1200, "end": 3000, "text": "与上一段重叠的台词", "segment_index": 3, "clip_index": 0},
+      {"start": 1500, "end": 4500, "text": "欢迎来到访谈节目", "segment_index": 1, "clip_index": 1},
+      {"start": 4500, "end": 5000, "text": "端点相接可共存", "segment_index": 4, "clip_index": 1}
+    ]
+  }'
+```
+
+响应：
+
+```json
+{
+  "kept": [
+    {"start": 0, "end": 1500, "text": "我们开始今天的话题", "segment_index": 2, "clip_index": 0},
+    {"start": 1500, "end": 4500, "text": "欢迎来到访谈节目", "segment_index": 1, "clip_index": 1},
+    {"start": 4500, "end": 5000, "text": "端点相接可共存", "segment_index": 4, "clip_index": 1}
+  ],
+  "dropped_indices": [1]
+}
+```
+
+`kept` 保留全部原字段、按 `(start, 输入下标)` 排序，可直接送入 `/layout/wrap`；空列表返回 `{"kept": [], "dropped_indices": []}`。
+
 ## 本地开发（不用容器）
 
 ```bash
@@ -630,7 +748,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 .
 ├── app/
 │   ├── __init__.py
-│   └── main.py          # FastAPI 应用、锚点推荐（全局最优匹配）、线性换算、字幕断行（全局最优排版）与剪辑投影逻辑
+│   └── main.py          # FastAPI 应用、锚点推荐（全局最优匹配）、线性换算、字幕断行（全局最优排版）、剪辑投影与单轨选段（带权区间调度）逻辑
 ├── Dockerfile           # 构建期安装依赖，容器启动即启动服务
 ├── docker-compose.yml   # 一键编排
 ├── requirements.txt
