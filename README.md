@@ -1,11 +1,12 @@
 # 访谈字幕时间轴校准 API
 
-基于 Python + FastAPI 的字幕时间轴校准服务，提供四个接口：
+基于 Python + FastAPI 的字幕时间轴校准服务，提供五个接口：
 
 1. **`POST /anchors/suggest` 锚点推荐**：提交**原片**与**成片**两条按开始时间严格递增的字幕序列，服务端在允许跳过片段的前提下做**全局最优**的文字精确匹配（重复台词、删段均按全局最优处理，而非逐条贪心），返回可直接用于 `/calibrate` 的同步锚点。
 2. **`POST /calibrate` 时间轴校准**：提交以**原录音毫秒**计时的字幕片段，以及至少两组「原时间 → 成片时间」同步锚点；服务端在相邻锚点之间做**分段线性换算**，输出成片时间轴上的字幕起止时间。
 3. **`POST /layout/wrap` 字幕断行**：提交字幕片段与行宽、行数约束，服务端按 **Unicode 码点显示宽度**（东亚全角/宽字符占 2 格、其余占 1 格）为每段做**全局最优**断行，保留原时码与文字，返回每段的各行文字与断行字符偏移。
 4. **`POST /edits/project` 剪辑投影**：提交源字幕 `segments` 与按成片顺序排列的 `clips`（允许源区间**重叠、重排、重复使用**）；服务端按**半开区间**求每条字幕与每段剪辑的交集，再按剪辑时长与源区间长度之比**线性映射**到成片时间轴，四舍五入到毫秒后丢弃零时长片段，返回可直接送入 `/layout/wrap` 的片段及未产生输出的字幕下标。
+5. **`POST /timeline/select` 展示轨选片**：接收与 `/edits/project` 输出兼容的候选片段（`start`、`end`、`text` 及来源下标），为**单条字幕展示轨**选出互不重叠的完整片段（**端点相接可共存、不裁剪**）；以保留总展示时长最大为首要目标，平局依次选保留条数多、输入下标升序序列字典序小的方案。
 
 ## 功能说明
 
@@ -90,6 +91,26 @@
 
   缺字段、类型错误等请求格式问题返回 `422` 且 `error` 为 `invalid_request`。
 
+### 展示轨选片 `/timeline/select`
+
+- 接收 `segments[]`：候选片段，每条含整数毫秒 `start` / `end`（半开区间 `[start, end)`）与 `text`（可省略，默认空字符串），并兼容 `/edits/project` 输出的来源下标 `segment_index` / `clip_index` 及其他任意额外字段——**响应中原字段全部原样保留**。
+- 为**单条字幕展示轨**（同一时刻只能展示一条字幕）选出一组互不重叠的完整片段：
+  - 片段一律**整条保留，绝不裁剪或改写时码**；
+  - 两片段半开区间实际相交才冲突，即 `s1 < e2 且 s2 < e1`；**端点相接**（一条的 `start` 等于另一条的 `end`）**可以共存**。
+- 在所有可行方案中依次按以下优先级取全局最优（加权区间调度，动态规划求解，而非贪心）：
+  1. 保留片段的**总展示时长** `sum(end - start)` 最大；
+  2. 总时长相同，取**保留条数最多**的方案；
+  3. 仍相同时，取选中片段的**输入下标升序序列字典序最小**的方案（逐下标比较，前缀相同则先出现较小下标的方案胜出，即同等条件下优先保留靠前的输入）。
+- 成功响应：
+  - `kept[]`：选中的片段（保留输入元素的全部字段），按 `(start, 输入下标)` **升序**排列；
+  - `dropped_indices[]`：未选中片段的**输入下标**，按**输入顺序**排列（即下标升序）。
+  - 输入为**空列表**时返回 `{"kept": [], "dropped_indices": []}`。
+- 以下情况返回 `422`，错误一次性收集，`location` 标明 `segments` 的字段、`index` 标明元素下标：
+  - `start` 或 `end` 为负（`negative_time`）；
+  - `end <= start`（`non_positive_duration`）。
+
+  缺字段、类型错误等请求格式问题返回 `422` 且 `error` 为 `invalid_request`。
+
 ## 单条启动命令
 
 无需手动安装依赖，依赖安装与服务启动均已纳入容器启动流程（构建镜像时安装依赖，容器启动时启动服务）：
@@ -130,6 +151,7 @@ docker compose down
 | 校准接口 | `POST http://localhost:8000/calibrate` |
 | 字幕断行接口 | `POST http://localhost:8000/layout/wrap` |
 | 剪辑投影接口 | `POST http://localhost:8000/edits/project` |
+| 展示轨选片接口 | `POST http://localhost:8000/timeline/select` |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI Schema | `http://localhost:8000/openapi.json` |
 
@@ -451,6 +473,119 @@ docker compose down
 
 字段缺失或类型错误等请求格式问题返回 `422` 且 `error` 为 `invalid_request`。
 
+### 请求 `POST /timeline/select`
+
+输入与 `/edits/project` 成功响应中的 `segments` 完全兼容，可直接透传：
+
+```json
+{
+  "segments": [
+    {
+      "start": 0,
+      "end": 1500,
+      "text": "我们开始今天的话题",
+      "segment_index": 2,
+      "clip_index": 0
+    },
+    {
+      "start": 1500,
+      "end": 4500,
+      "text": "欢迎来到访谈节目",
+      "segment_index": 1,
+      "clip_index": 1
+    }
+  ]
+}
+```
+
+- `segments[].start` / `segments[].end`：整数毫秒，半开区间，要求 `start >= 0`、`end > start`。
+- `segments[].text`：字幕文字，可省略（默认空字符串），原样保留。
+- `segment_index` / `clip_index` 以及任何其他额外字段均原样透传到 `kept`，不参与选片计算。
+- `segments` 允许为空，此时返回空结果。
+
+### 成功响应 `200`
+
+上例两条片段在 `1500ms` 处端点相接，可以共存，故全部保留：
+
+```json
+{
+  "kept": [
+    {
+      "start": 0,
+      "end": 1500,
+      "text": "我们开始今天的话题",
+      "segment_index": 2,
+      "clip_index": 0
+    },
+    {
+      "start": 1500,
+      "end": 4500,
+      "text": "欢迎来到访谈节目",
+      "segment_index": 1,
+      "clip_index": 1
+    }
+  ],
+  "dropped_indices": []
+}
+```
+
+再看一个有重叠的例子，演示三级优先级：
+
+```json
+{
+  "segments": [
+    { "start": 0, "end": 2000, "text": "单条长片段" },
+    { "start": 0, "end": 1000, "text": "短片段甲" },
+    { "start": 1000, "end": 2000, "text": "短片段乙" }
+  ]
+}
+```
+
+单条长片段（总时长 2000、1 条）与两条相接短片段（总时长 2000、2 条）总时长相同，按第二优先级取条数更多的后者：
+
+```json
+{
+  "kept": [
+    { "start": 0, "end": 1000, "text": "短片段甲" },
+    { "start": 1000, "end": 2000, "text": "短片段乙" }
+  ],
+  "dropped_indices": [0]
+}
+```
+
+### 选片错误响应 `422`
+
+所有校验错误一次性收集返回，`location` 标明字段，`index` 为元素下标（从 0 开始）：
+
+```json
+{
+  "error": "timeline_select_failed",
+  "detail": [
+    {
+      "location": "segments.start",
+      "index": 0,
+      "code": "negative_time",
+      "message": "segments 第 0 条 start 为负：-5"
+    },
+    {
+      "location": "segments.end",
+      "index": 1,
+      "code": "non_positive_duration",
+      "message": "segments 第 1 条时长非正：start=100，end=100，要求 end > start"
+    }
+  ]
+}
+```
+
+错误代码：
+
+| code | 含义 |
+| --- | --- |
+| `negative_time` | `segments[].start` 或 `segments[].end` 为负毫秒 |
+| `non_positive_duration` | 片段 `end <= start`，时长非正 |
+
+字段缺失或类型错误等请求格式问题返回 `422` 且 `error` 为 `invalid_request`。
+
 ## 调用示例
 
 ### 第一步：`/anchors/suggest` 自动生成锚点
@@ -617,6 +752,48 @@ curl -s -X POST http://localhost:8000/layout/wrap \
   }'
 ```
 
+### `/timeline/select` 为单条展示轨选出互不重叠的字幕
+
+直接把 `/edits/project` 响应里的 `segments`（或任何含 `start` / `end` / `text` 的片段列表）传给选片接口。下例中第 0 条与第 1 条时间重叠、与第 2 条端点相接：
+
+```bash
+curl -s -X POST http://localhost:8000/timeline/select \
+  -H "Content-Type: application/json" \
+  -d '{
+    "segments": [
+      {"start": 0, "end": 1000, "text": "字幕甲", "segment_index": 0, "clip_index": 0},
+      {"start": 200, "end": 1200, "text": "字幕乙", "segment_index": 1, "clip_index": 0},
+      {"start": 1000, "end": 2000, "text": "字幕丙", "segment_index": 2, "clip_index": 0}
+    ]
+  }'
+```
+
+响应：
+
+```json
+{
+  "kept": [
+    {
+      "start": 0,
+      "end": 1000,
+      "text": "字幕甲",
+      "segment_index": 0,
+      "clip_index": 0
+    },
+    {
+      "start": 1000,
+      "end": 2000,
+      "text": "字幕丙",
+      "segment_index": 2,
+      "clip_index": 0
+    }
+  ],
+  "dropped_indices": [1]
+}
+```
+
+「字幕甲」与「字幕丙」在 `1000ms` 处端点相接可共存，总展示时长 2000ms（优于只保留「字幕乙」的 1000ms），由首要目标直接决定；输入元素的 `segment_index` / `clip_index` 等原字段均原样保留。
+
 ## 本地开发（不用容器）
 
 ```bash
@@ -630,7 +807,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 .
 ├── app/
 │   ├── __init__.py
-│   └── main.py          # FastAPI 应用、锚点推荐（全局最优匹配）、线性换算、字幕断行（全局最优排版）与剪辑投影逻辑
+│   └── main.py          # FastAPI 应用、锚点推荐（全局最优匹配）、线性换算、字幕断行（全局最优排版）、剪辑投影与展示轨选片（加权区间调度）逻辑
 ├── Dockerfile           # 构建期安装依赖，容器启动即启动服务
 ├── docker-compose.yml   # 一键编排
 ├── requirements.txt
